@@ -1,0 +1,16 @@
+# Python and editor files don't belong in the repository.
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+env1/
+.vs/
+.pytest_cache/
+
+# Keep credentials and local evidence out of GitHub.
+.env
+.streamlit/secrets.toml
+data/
+
+.DS_Store
