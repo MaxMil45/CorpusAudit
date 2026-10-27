@@ -1,49 +1,70 @@
 # CorpusAudit
 
-CorpusAudit helps trace a statistic back to the report or dataset behind it. Paste a claim for a web search, or add PDFs and search your own library.
+CorpusAudit helps trace a statistic back to a report or dataset. Paste a claim for a web search, or add PDFs and search your own library.
 
-## Run it
+## What you need
 
-You’ll need Python 3.10 or newer. The web search and AI summaries use the OpenAI API and may incur charges. The app can still extract PDFs and search its local index without an API key.
+- Python 3.10 or newer
+- [Ollama](https://ollama.com/download) to run the language model on your computer
+- About 2.5 GB for the default `qwen3:4b-instruct` model download
 
-### Windows PowerShell
+CorpusAudit does not need an OpenAI API key. Model prompts and PDF passages are processed by Ollama locally. The `openai` Python package is used only as a compatible client pointed at Ollama on `localhost`; it does not send requests to OpenAI. Web search sends the claim text to public search providers through `ddgs`; those providers may log queries, change availability, or rate-limit requests.
+
+## Run it on Windows
+
+Install Ollama, then open PowerShell and download the model once:
+
+```powershell
+ollama pull qwen3:4b-instruct
+```
+
+In the project folder, install the Python dependencies and start the app:
 
 ```powershell
 py -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 pip install -r requirements.txt
-Copy-Item .env.example .env
-notepad .env
 streamlit run app.py
 ```
 
-Put your API key in `.env` if you want to use web search or AI summaries. Keep that file private; it is excluded from Git.
+Ollama should be running while you use CorpusAudit. To use a different model or local Ollama address, copy `.env.example` to `.env` and edit `OLLAMA_MODEL` or `OLLAMA_BASE_URL`. You do not need a `.env` file for the defaults.
 
-On macOS or Linux, use `python3 -m venv .venv`, `source .venv/bin/activate`, and `cp .env.example .env` in place of the Windows commands.
+## Use the app
 
-## Using CorpusAudit
+- **Statistic Checker:** Paste the statistic and choose Web search or My PDF library. Web search works without uploading a document.
+- **Find statistics:** Discover figures about a topic, optionally narrowed by place, population, or year. It searches with several research-focused queries, looks through retrieved pages for number-bearing passages, and links each finding to its source. If the local model misses a passage, the app can show the source sentence directly.
+- **Research Explorer:** Add reports in the sidebar and ask about a metric, year, country, or population.
+- **Evidence Library:** See what is indexed or clear the local index. Clearing the index does not delete your original PDFs.
+- **Study Explainer:** Search your indexed PDFs for a question, choose up to three matching papers, and get a paper-by-paper screening summary plus a comparison. It shows the passages and page numbers used; reading-priority labels are suggestions, not decisions to discard a paper.
 
-- **Statistic Checker:** Paste the claim as you saw it. Web search is the default, and citations link to the pages used.
-- **Research Explorer:** Add a few reports in the sidebar, then ask about a metric, year, country, or population.
-- **Evidence Library:** Review what is indexed or clear the local index.
+## Project layout
 
-When using your own PDFs, the files and Chroma index stay in the project’s `data` folder. Text passages selected for an AI summary or audit are sent to the OpenAI API. Don’t use confidential reports unless that’s acceptable for your use case.
+```text
+app.py                    Streamlit entry point
+ui/                       Page sections and shared display helpers
+corpus_audit_core/
+  analysis.py              Research answers and claim checks
+  documents.py             PDF extraction, indexing, retrieval, and source ranking
+  llm.py                   Local Ollama client
+  prompts.py               Model instructions
+  settings.py              Local Chroma storage
+tests/                     Focused tests for text chunking
+```
+
+`corpus_audit.py` is a small compatibility module for older imports; new code should import from `corpus_audit_core` or `ui`.
 
 ## How it works
 
-PyMuPDF extracts selectable text page by page. CorpusAudit splits it into overlapping passages and stores the passages with their source filename and page number. Chroma retrieves passages for a question; the model then summarizes or compares them with a claim.
+PyMuPDF extracts selectable PDF text page by page. Chroma stores overlapping passages with their filename and page number. The local model summarizes or compares retrieved passages.
 
-For a web check, the Responses API searches the web and returns cited sources. The model’s verdict is a useful lead, not proof. Open the source and check that its population, dates, units, and definitions match the claim.
+For web checks, `ddgs` searches public search engines and returns titles, links, and snippets. The local model compares those snippets with the claim. Topic search tries several query phrasings, extracts short number-bearing passages from a few results, and checks that any model-selected statistic is copied from its quote. If the model returns no verifiable result, the app can show the exact passage instead. A site may block page retrieval, in which case a result is labelled as a search snippet. Open the links before relying on a result: a quote is traceability, not proof of source quality.
 
 ## Current limits
 
+- Public search can be unreliable or rate-limited. It may miss the original source.
+- Search results and snippets are sent to the local model, but the claim itself is sent to the search provider.
 - Scanned PDFs and complex tables are not parsed yet.
-- A search can miss the best source or retrieve evidence that only looks relevant.
-- The app does not independently verify that a web source is authoritative or that no newer dataset exists.
+- A model verdict is not proof. Check the source’s definitions, dates, and methods.
 - Re-uploading a PDF replaces the indexed version with the same filename. Rename different reports that share a filename.
 - A lack of evidence is not evidence that a claim is false.
-
-## A good first demo
-
-Try a claim with a number, place, and year. Then open the cited source and check its definition and methods. For the local workflow, add two reports about the same topic and ask what each one measures. The differences in scope are often more useful than a single verdict.
