@@ -49,3 +49,19 @@ def ask_json(
     except json.JSONDecodeError:
         pass
     return {"summary": text, "verdict": "Insufficient evidence", "caveats": [], "evidence_ids": []}
+
+
+def ask_text(instructions: str, payload: str, *, max_output_tokens: int = 500) -> str:
+    """Ask Ollama for readable prose when a human-facing JSON object is unnecessary."""
+    response = _client().chat.completions.create(
+        model=DEFAULT_MODEL,
+        messages=[
+            {"role": "system", "content": instructions},
+            {"role": "user", "content": payload},
+        ],
+        temperature=0.2,
+        max_tokens=max_output_tokens,
+    )
+    text = (response.choices[0].message.content or "").strip()
+    # Avoid showing stray Markdown fences around the model's short comparison.
+    return re.sub(r"^```(?:markdown|text|json)?\s*|\s*```$", "", text, flags=re.IGNORECASE).strip()

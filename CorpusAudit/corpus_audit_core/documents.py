@@ -2,6 +2,7 @@
 
 import hashlib
 import re
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -164,24 +165,33 @@ def search_evidence(query: str, n_results: int = 5) -> list[dict[str, Any]]:
     ]
 
 
-def rank_sources_for_question(query: str, max_sources: int = 12) -> list[dict[str, Any]]:
+def rank_sources_for_question(query: str, max_sources: int = 100) -> list[dict[str, Any]]:
     """Rank indexed PDFs by how closely their passages match a topic or question."""
-    # Looking across many passages helps surface several papers instead of repeating one paper.
-    passages = search_evidence(query, n_results=80)
-    matches: dict[str, dict[str, Any]] = {}
-    for passage in passages:
-        source = passage["source"]
-        match = matches.setdefault(source, {"source": source, "hits": 0, "best_distance": None, "best_page": passage["page"]})
-        match["hits"] += 1
-        distance = passage.get("distance")
-        if isinstance(distance, (int, float)) and (
-            match["best_distance"] is None or distance < match["best_distance"]
-        ):
-            match["best_distance"] = distance
-            match["best_page"] = passage["page"]
+    # Query each PDF separately so one long paper cannot occupy all the nearest-result slots.
+    stats = get_collection_stats()
+    collection = get_collection()
+    ranked = []
+    for source, chunk_count in stats.get("source_counts", {}).items():
+        result = collection.query(
+            query_texts=[query],
+            n_results=min(3, chunk_count),
+            where={"source": source},
+            include=["metadatas", "distances"],
+        )
+        metadatas = result.get("metadatas", [[]])[0]
+        distances = result.get("distances", [[]])[0]
+        if not distances:
+            continue
+        best_index = min(range(len(distances)), key=lambda index: distances[index])
+        ranked.append({
+            "source": source,
+            "hits": len(distances),
+            "best_distance": distances[best_index],
+            "best_page": metadatas[best_index].get("page", "?"),
+        })
 
     return sorted(
-        matches.values(),
+        ranked,
         key=lambda item: (
             item["best_distance"] if item["best_distance"] is not None else float("inf"),
             -item["hits"],
@@ -215,13 +225,22 @@ def get_collection_stats() -> dict[str, Any]:
     collection = get_collection()
     count = collection.count()
     if count == 0:
-        return {"chunks": 0, "documents": 0, "sources": [], "collection": COLLECTION_NAME, "storage": str(DB_DIR)}
+        return {
+            "chunks": 0,
+            "documents": 0,
+            "sources": [],
+            "source_counts": {},
+            "collection": COLLECTION_NAME,
+            "storage": str(DB_DIR),
+        }
     records = collection.get(include=["metadatas"])
-    sources = sorted({m.get("source", "Unknown") for m in records.get("metadatas", [])})
+    source_counts = Counter(m.get("source", "Unknown") for m in records.get("metadatas", []))
+    sources = sorted(source_counts)
     return {
         "chunks": count,
         "documents": len(sources),
         "sources": sources,
+        "source_counts": dict(source_counts),
         "collection": COLLECTION_NAME,
         "storage": str(DB_DIR),
     }

@@ -8,13 +8,15 @@ from urllib.parse import urlparse
 from ddgs import DDGS
 
 from .documents import get_source_passages, search_evidence
-from .llm import ask_json
+from .llm import ask_json, ask_text
 from .prompts import (
     LOCAL_AUDIT_INSTRUCTIONS,
     RESEARCH_INSTRUCTIONS,
     TOPIC_STATISTICS_INSTRUCTIONS,
     WEB_AUDIT_INSTRUCTIONS,
-    STUDY_SCREENING_INSTRUCTIONS,
+    SINGLE_STUDY_SCREENING_INSTRUCTIONS,
+    STUDY_POINT_EXPLANATION_INSTRUCTIONS,
+    STUDY_COMPARISON_INSTRUCTIONS,
 )
 
 SEARCH_REGION = os.getenv("SEARCH_REGION", "uk-en")
@@ -334,14 +336,15 @@ def check_claim_in_library(claim: str, n_results: int = 6) -> dict[str, Any]:
     return {"result": audit_claim(claim, passages), "passages": passages}
 
 
-def _study_excerpt(text: str, topic_terms: list[str], max_chars: int = 600) -> str:
+def _study_excerpt(text: str, topic_terms: list[str], max_chars: int = 900) -> str:
     """Keep the most useful part of a long indexed chunk while preserving source wording."""
     if len(text) <= max_chars:
         return text
 
     markers = topic_terms + [
         "abstract", "method", "participant", "sample", "result", "finding",
-        "conclusion", "limitation", "outcome",
+        "conclusion", "limitation", "outcome", "equation", "objective", "loss", "formula",
+        "figure", "fig.", "algorithm",
     ]
     possible_starts = {0}
     lower_text = text.casefold()
@@ -349,12 +352,16 @@ def _study_excerpt(text: str, topic_terms: list[str], max_chars: int = 600) -> s
         position = lower_text.find(marker)
         if position >= 0:
             possible_starts.add(max(0, position - max_chars // 4))
+    for match in re.finditer(r"=|\\begin|\\sum|\\frac|\\arg", lower_text):
+        possible_starts.add(max(0, match.start() - max_chars // 4))
 
     # Keep the window with the most study-relevant terms and data markers.
     def window_score(start: int) -> int:
         window = text[start:start + max_chars].casefold()
         score = sum(window.count(term) for term in topic_terms)
         score += sum(window.count(term) * 2 for term in ("method", "result", "finding", "conclusion"))
+        score += sum(window.count(term) * 4 for term in ("equation", "formula", "objective", "loss"))
+        score += sum(window.count(symbol) * 2 for symbol in ("=", "\\sum", "\\frac"))
         score += len(re.findall(r"\d", window))
         return score
 
@@ -363,7 +370,7 @@ def _study_excerpt(text: str, topic_terms: list[str], max_chars: int = 600) -> s
 
 
 def _choose_study_passages(
-    passages: list[dict[str, Any]], topic: str, limit: int = 3
+    passages: list[dict[str, Any]], topic: str, limit: int = 4
 ) -> list[dict[str, Any]]:
     """Pick a few passages that cover the abstract, methods, and reported results."""
     topic_terms = _topic_terms(topic, "")
@@ -379,6 +386,12 @@ def _choose_study_passages(
                 ("results", 4), ("findings", 3), ("conclusion", 3), ("limitations", 2),
             ) if marker in text
         )
+        if any(marker in text for marker in ("equation", "formula", "objective", "loss", "\u2211", "\\sum", "\\frac")):
+            score += 7
+        if any(marker in text for marker in ("figure", "fig.", "algorithm", "we propose", "our approach")):
+            score += 3
+        if "=" in text and ("loss" in text or "probab" in text or "function" in text):
+            score += 3
         if re.search(r"\d", text):
             score += 1
         scored.append((score, passage))
@@ -400,19 +413,79 @@ def _choose_study_passages(
     return chosen
 
 
-def explain_studies(topic: str, source_names: list[str]) -> dict[str, Any]:
+def _fallback_study_points(
+    evidence_ids: list[str], evidence_by_id: dict[str, dict[str, Any]]
+) -> list[dict[str, str]]:
+    """Pull exact, relevant source sentences when the local model misses its format."""
+    patterns = {
+        "Task": re.compile(r"\b(object|face|facial|instance)\b.{0,65}\b(detect|recogn|classif|segment|verif|identif)", re.I),
+        "Dataset/benchmark": re.compile(r"\b(dataset|benchmark|COCO|ImageNet|CIFAR|LFW|VGGFace|MegaFace)\b", re.I),
+        "Metric/result": re.compile(r"\b(AP|mAP|accuracy|precision|recall|F1|FPS|error rate|AUC|rank-?1)\b.*\d|\d.*\b(AP|mAP|accuracy|precision|recall|F1|FPS|error rate|AUC|rank-?1)\b", re.I),
+        "Main finding": re.compile(r"\b(found|findings|results|achieve|outperform|improv|reduc|increase|decreas)\b", re.I),
+        "Method": re.compile(r"\b(we propose|we introduce|our method|architecture|network|model|approach|algorithm)\b", re.I),
+        "Stated limitation": re.compile(r"\b(limitation|challenge|failure|unable to|does not|cannot|however)\b", re.I),
+    }
+    output: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(category: str, evidence_id: str, quote: str) -> None:
+        quote = quote.strip()
+        key = (category, _normalise_quote(quote))
+        if len(quote) < 25 or key in seen:
+            return
+        seen.add(key)
+        output.append({
+            "category": category,
+            "claim": quote,
+            "evidence_id": evidence_id,
+            "quote": quote,
+            "source_extract": "true",
+        })
+
+    for evidence_id in evidence_ids:
+        passage = evidence_by_id[evidence_id]["text"]
+        # PDF text often breaks formulas across lines, so keep the whole compact excerpt for review.
+        if re.search(r"(?:=|\\sum|\\frac|\\arg|equation\s+\d)", passage, re.I):
+            add("Equation/algorithm", evidence_id, passage)
+
+        # Join PDF line wraps before looking for sentences. Splitting on every line
+        # break produced unreadable fragments from two-column and wrapped abstracts.
+        readable_passage = " ".join(passage.split())
+        sentences = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9])", readable_passage)
+        for sentence in sentences:
+            clean = " ".join(sentence.split()).strip(" -*#")
+            if len(clean) < 70 or len(clean) > 650:
+                continue
+            for category, pattern in patterns.items():
+                if pattern.search(clean):
+                    add(category, evidence_id, clean)
+            if len(output) >= 10:
+                return output
+    return output
+
+
+def explain_studies(
+    topic: str,
+    source_names: list[str],
+    priorities: list[str] | None = None,
+    project_context: str = "",
+) -> dict[str, Any]:
     """Summarize up to three indexed papers and compare their scope and findings."""
     topic = topic.strip()
+    project_context = project_context.strip()
     source_names = list(dict.fromkeys(source_names))[:3]
+    priorities = [item.strip() for item in (priorities or []) if item.strip()][:5]
     if not topic or not source_names:
         return {"studies": [], "comparison": {}}
 
-    paper_blocks: list[str] = []
+    papers: list[dict[str, Any]] = []
     allowed_ids: dict[str, set[str]] = {}
     evidence_by_id: dict[str, dict[str, Any]] = {}
     for paper_index, source_name in enumerate(source_names, start=1):
         document_id = f"D{paper_index}"
-        selected = _choose_study_passages(get_source_passages(source_name), topic)
+        selected = _choose_study_passages(
+            get_source_passages(source_name), f"{topic} {project_context}"
+        )
         if not selected:
             continue
 
@@ -421,7 +494,9 @@ def explain_studies(topic: str, source_names: list[str]) -> dict[str, Any]:
         for passage_index, passage in enumerate(selected, start=1):
             evidence_id = f"{document_id}P{passage_index}"
             allowed_ids[document_id].add(evidence_id)
-            excerpt = _study_excerpt(passage["text"], _topic_terms(topic, ""))
+            excerpt = _study_excerpt(
+                passage["text"], _topic_terms(topic, project_context)
+            )
             evidence_by_id[evidence_id] = {
                 "source": source_name,
                 "page": passage["page"],
@@ -430,52 +505,213 @@ def explain_studies(topic: str, source_names: list[str]) -> dict[str, Any]:
             evidence_blocks.append(
                 f"[{evidence_id} | PDF page {passage['page']}]\n{excerpt}"
             )
-        paper_blocks.append(
-            f"DOCUMENT {document_id}: {source_name}\n" + "\n\n".join(evidence_blocks)
-        )
+        papers.append({
+            "document_id": document_id,
+            "source": source_name,
+            "evidence_ids": list(allowed_ids[document_id]),
+            "evidence_text": "\n\n".join(evidence_blocks),
+        })
 
-    if not paper_blocks:
+    if not papers:
         return {"studies": [], "comparison": {}, "message": "No readable text was found in the selected PDFs."}
 
-    result = ask_json(
-        STUDY_SCREENING_INSTRUCTIONS,
-        f"RESEARCH QUESTION OR TOPIC: {topic}\n\nSUPPLIED PAPER EXCERPTS:\n\n"
-        + "\n\n".join(paper_blocks),
-        max_output_tokens=1000,
-    )
-
-    # Remove model-generated IDs that do not point to passages we actually supplied.
-    safe_studies = []
-    by_id = {
-        f"D{index}": source_name
-        for index, source_name in enumerate(source_names, start=1)
-        if f"D{index}" in allowed_ids
+    priority_text = ", ".join(priorities) or "direct task match and evaluation evidence"
+    valid_categories = {
+        "Task", "Design", "Population", "Method", "Equation/algorithm", "Dataset/benchmark",
+        "Metric/result", "Main finding", "Stated limitation", "Fit to goal",
     }
-    studies = result.get("studies", [])
-    if isinstance(studies, list):
-        for study in studies:
-            if not isinstance(study, dict):
-                continue
-            document_id = str(study.get("document_id", ""))
-            if document_id not in by_id:
-                continue
-            study["source"] = by_id[document_id]
-            refs = study.get("evidence_ids", [])
-            if not isinstance(refs, list):
-                refs = []
-            study["evidence_ids"] = [ref for ref in refs if ref in allowed_ids[document_id]]
-            if study.get("reading_priority") not in {"Read next", "Maybe", "Lower priority"}:
-                study["reading_priority"] = "Maybe"
-            safe_studies.append(study)
+    exact_phrase_categories = {"Equation/algorithm", "Dataset/benchmark", "Metric/result", "Main finding"}
+    safe_studies: list[dict[str, Any]] = []
+    for paper in papers:
+        document_id = paper["document_id"]
+        payload = (
+            f"RESEARCH GOAL: {topic}\nPROJECT CONTEXT: {project_context or 'Not supplied'}\n"
+            f"REVIEW PRIORITIES: {priority_text}\n"
+            f"PAPER ID: {document_id}\nPDF FILE: {paper['source']}\n\n"
+            f"EXCERPTS:\n{paper['evidence_text']}"
+        )
+        model_error = ""
+        try:
+            summary = ask_json(
+                SINGLE_STUDY_SCREENING_INSTRUCTIONS,
+                payload,
+                max_output_tokens=700,
+            )
+        except Exception as exc:
+            summary = {}
+            model_error = str(exc)
 
-    comparison = result.get("comparison", {})
-    if not isinstance(comparison, dict):
-        comparison = {}
-    comparison_refs = comparison.get("evidence_ids", [])
-    all_allowed_ids = set().union(*allowed_ids.values()) if allowed_ids else set()
-    comparison["evidence_ids"] = [
-        ref for ref in comparison_refs if ref in all_allowed_ids
-    ] if isinstance(comparison_refs, list) else []
+        # Keep a point only when the model's quotation can be found in that exact PDF passage.
+        points = []
+        candidates = summary.get("points", [])
+        if isinstance(candidates, list):
+            for candidate in candidates[:10]:
+                if not isinstance(candidate, dict):
+                    continue
+                category = str(candidate.get("category", "")).strip()
+                claim = str(candidate.get("claim", "")).strip()
+                evidence_id = str(candidate.get("evidence_id", "")).strip()
+                quote = str(candidate.get("quote", "")).strip()
+                passage = evidence_by_id.get(evidence_id)
+                if (
+                    category not in valid_categories
+                    or not claim
+                    or not quote
+                    or evidence_id not in allowed_ids[document_id]
+                    or not passage
+                ):
+                    continue
+                quote_normalised = _normalise_quote(quote)
+                if quote_normalised not in _normalise_quote(passage["text"]):
+                    continue
+                # Prevent altered numbers, datasets, and metric names from being stated as findings.
+                if category in exact_phrase_categories and _normalise_quote(claim) not in quote_normalised:
+                    continue
+                claim_numbers = re.findall(r"\d+(?:[,.]\d+)*%?", claim)
+                quote_numbers = re.findall(r"\d+(?:[,.]\d+)*%?", quote)
+                if not all(number in quote_numbers for number in claim_numbers):
+                    continue
+                points.append({
+                    "category": category,
+                    "claim": claim,
+                    "evidence_id": evidence_id,
+                    "quote": quote,
+                })
+
+        # Keep exact task, metric, result, and equation text even when the model misses a category.
+        present_categories = {point["category"] for point in points}
+        for point in _fallback_study_points(paper["evidence_ids"], evidence_by_id):
+            if point["category"] in present_categories:
+                continue
+            points.append(point)
+            present_categories.add(point["category"])
+            if len(points) >= 10:
+                break
+
+        # When the strict summary schema fails, make the exact fallback passages useful
+        # by asking for brief, plain-language explanations tied to their existing IDs.
+        fallback_points = [point for point in points if point.get("source_extract")][:6]
+        if fallback_points:
+            explanation_input = "\n\n".join(
+                f"[{point['evidence_id']} | PDF page {evidence_by_id[point['evidence_id']]['page']}]\n"
+                f"{point['quote'][:650]}"
+                for point in fallback_points
+            )
+            try:
+                explanation_result = ask_json(
+                    STUDY_POINT_EXPLANATION_INSTRUCTIONS,
+                    f"PROJECT GOAL: {topic}\nPROJECT DESCRIPTION: {project_context or 'Not supplied'}\n"
+                    f"PAPER FILE: {paper['source']}\nEXCERPTS:\n{explanation_input}",
+                    max_output_tokens=350,
+                )
+                explanations = explanation_result.get("explanations", [])
+                if isinstance(explanations, list):
+                    explanations_by_id = {
+                        str(item.get("evidence_id", "")).strip(): str(item.get("explanation", "")).strip()
+                        for item in explanations
+                        if isinstance(item, dict)
+                    }
+                    for point in fallback_points:
+                        explanation = explanations_by_id.get(point["evidence_id"], "")
+                        if explanation:
+                            point["explanation"] = explanation[:500]
+            except Exception:
+                # Exact source wording is still available if the local model cannot explain it.
+                pass
+
+        for point in points:
+            passage_text = evidence_by_id[point["evidence_id"]]["text"]
+            locator_matches = re.findall(
+                r"\b(?:Figure|Fig\.?|Equation|Eq\.?)\s*(?:No\.?\s*)?\d+(?:\.\d+)?",
+                passage_text,
+                flags=re.IGNORECASE,
+            )
+            if locator_matches:
+                point["locator"] = ", ".join(dict.fromkeys(locator_matches[:3]))
+
+        priority = summary.get("reading_priority")
+        study = {
+            "document_id": document_id,
+            "source": paper["source"],
+            "points": points,
+            "reading_priority": (
+                priority
+                if points and priority in {"Read next", "Maybe", "Lower priority"}
+                else ""
+            ),
+            "priority_reason": str(summary.get("priority_reason", "")).strip(),
+        }
+        if not points:
+            study["model_note"] = (
+                f"Ollama could not summarize this paper: {model_error}"
+                if model_error
+                else "No summary points passed the source-quote check. The excerpts below are available for direct review."
+            )
+        safe_studies.append(study)
+
+    comparable_studies = [study for study in safe_studies if study["points"]]
+    comparison: dict[str, Any] = {}
+    if len(comparable_studies) > 1:
+        # The comparison sees only points that were verified against exact PDF quotes.
+        comparison_input = []
+        point_order = {
+            "Equation/algorithm": 0,
+            "Task": 1,
+            "Dataset/benchmark": 2,
+            "Metric/result": 3,
+            "Main finding": 4,
+            "Method": 5,
+        }
+        for study in comparable_studies:
+            selected_points = sorted(
+                study["points"],
+                key=lambda point: point_order.get(point["category"], 6),
+            )[:6]
+            facts = "\n".join(
+                f"- {point['category']}: {point['claim'][:300]} [{point['evidence_id']}] "
+                f"Exact quote: {point['quote'][:650 if point['category'] == 'Equation/algorithm' else 350]}"
+                for point in selected_points
+            )
+            comparison_input.append(f"PAPER: {study['source']}\n{facts}")
+        try:
+            comparison_text = ask_text(
+                STUDY_COMPARISON_INSTRUCTIONS,
+                f"RESEARCH GOAL: {topic}\nPROJECT CONTEXT: {project_context or 'Not supplied'}\n"
+                f"REVIEW PRIORITIES: {priority_text}\n\n"
+                + "\n\n".join(comparison_input),
+                max_output_tokens=500,
+            )
+            # Never pass a raw JSON blob through to the interface as a shortlist recommendation.
+            if comparison_text.lstrip().startswith(("{", "[")) or re.search(
+                r'\{\s*"(?:shared_ground|best_supported_match)"\s*:',
+                comparison_text,
+            ):
+                comparison = {
+                    "comparison_note": "The local model returned an unreadable comparison. The verified paper points are still shown below."
+                }
+            elif comparison_text:
+                valid_ids = {
+                    point["evidence_id"]
+                    for study in comparable_studies
+                    for point in study["points"]
+                }
+                comparison_text = re.sub(
+                    r"\[(D\d+P\d+)\]",
+                    lambda match: match.group(0) if match.group(1) in valid_ids else "",
+                    comparison_text,
+                )
+                comparison = {"comparison_text": comparison_text}
+            else:
+                comparison = {"comparison_note": "The model returned an empty comparison. Review the verified points below."}
+        except Exception as exc:
+            comparison = {"comparison_note": f"The paper points are ready, but comparison failed: {exc}"}
+    elif len(safe_studies) > 1:
+        comparison = {
+            "comparison_note": "There were not enough quote-verified points across multiple papers to make a reliable comparison. Review the passages below or select different papers."
+        }
+    elif len(safe_studies) == 1:
+        comparison = {"overall_takeaway": "One paper was selected, so this run provides a single-paper screen."}
+
     return {
         "studies": safe_studies,
         "comparison": comparison,

@@ -27,7 +27,7 @@ def main() -> None:
             "Bring a statistic you have already seen.",
             "Start with a subject and discover reported numbers.",
             "Search the PDFs saved in your local library.",
-            "Compare a few papers before reading them in full.",
+            "Rank your library, then screen up to three papers at a time.",
         ),
     ):
         with column:

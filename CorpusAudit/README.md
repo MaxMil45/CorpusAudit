@@ -36,7 +36,7 @@ Ollama should be running while you use CorpusAudit. To use a different model or 
 - **Find statistics:** Discover figures about a topic, optionally narrowed by place, population, or year. It searches with several research-focused queries, looks through retrieved pages for number-bearing passages, and links each finding to its source. If the local model misses a passage, the app can show the source sentence directly.
 - **Research Explorer:** Add reports in the sidebar and ask about a metric, year, country, or population.
 - **Evidence Library:** See what is indexed or clear the local index. Clearing the index does not delete your original PDFs.
-- **Study Explainer:** Search your indexed PDFs for a question, choose up to three matching papers, and get a paper-by-paper screening summary plus a comparison. It shows the passages and page numbers used; reading-priority labels are suggestions, not decisions to discard a paper.
+- **Study Explainer:** Search all indexed PDFs for a question, choose up to three matching papers, and optionally describe what you are trying to build. Set priorities such as exact task match, benchmark evidence, robustness, or deployment practicality. For computer-vision research it distinguishes tasks such as object detection, fine-grained recognition, face verification, and face identification, and looks for methods, equations or algorithms, datasets, metrics, results, baselines, and limitations. It explains useful passages in plain language, compares the selected papers with practical guidance about which supported ideas may fit the project, and cites filenames plus PDF pages. If the extracted text names a figure or equation, it points to that too. Equations are shown as extracted from the PDF text for inspection. Recommendations are a shortlist aid, not a paper-quality score or a decision to discard a paper.
 
 ## Project layout
 
@@ -58,6 +58,8 @@ tests/                     Focused tests for text chunking
 
 PyMuPDF extracts selectable PDF text page by page. Chroma stores overlapping passages with their filename and page number. The local model summarizes or compares retrieved passages.
 
+Study Explainer retrieves a small set of relevant pages from each selected PDF, checks that each summary quote occurs in the retrieved text, and gives the comparison only those checked points. This makes its advice traceable, but it does not mean that the whole paper has been read or independently assessed. The optional project description and review priorities help frame the comparison. Formula text can be distorted by PDF extraction; use the displayed page reference to check the original before copying an equation or algorithm. If the selected passages do not contain enough evidence, the app may leave a point out or decline to rank the papers.
+
 For web checks, `ddgs` searches public search engines and returns titles, links, and snippets. The local model compares those snippets with the claim. Topic search tries several query phrasings, extracts short number-bearing passages from a few results, and checks that any model-selected statistic is copied from its quote. If the model returns no verifiable result, the app can show the exact passage instead. A site may block page retrieval, in which case a result is labelled as a search snippet. Open the links before relying on a result: a quote is traceability, not proof of source quality.
 
 ## Current limits
@@ -65,6 +67,7 @@ For web checks, `ddgs` searches public search engines and returns titles, links,
 - Public search can be unreliable or rate-limited. It may miss the original source.
 - Search results and snippets are sent to the local model, but the claim itself is sent to the search provider.
 - Scanned PDFs and complex tables are not parsed yet.
+- Study Explainer only reviews a few retrieved passages per paper. Important methods, equations, results, or limitations may be elsewhere in the PDF; verify recommendations in the original paper.
 - A model verdict is not proof. Check the source’s definitions, dates, and methods.
 - Re-uploading a PDF replaces the indexed version with the same filename. Rename different reports that share a filename.
 - A lack of evidence is not evidence that a claim is false.
