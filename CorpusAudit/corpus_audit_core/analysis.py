@@ -2,6 +2,7 @@
 
 import os
 import re
+from datetime import date
 from typing import Any
 from urllib.parse import urlparse
 
@@ -23,7 +24,7 @@ SEARCH_REGION = os.getenv("SEARCH_REGION", "uk-en")
 
 # The default Ollama model has a 4,096-token context window. These caps leave room
 # for the instructions and the model's answer, even when a page is unusually long.
-TOPIC_MODEL_SOURCE_COUNT = 3
+TOPIC_MODEL_SOURCE_COUNT = 5
 TOPIC_MODEL_SOURCE_CHARS = 700
 TOPIC_SEARCH_RESULT_COUNT = 6
 TOPIC_PAGE_CHAR_LIMIT = 30000
@@ -43,24 +44,40 @@ def _topic_terms(topic: str, focus: str) -> list[str]:
     ]
 
 
-def _statistic_passages(text: str, topic_terms: list[str], limit: int = 2) -> list[str]:
+def _statistic_passages(
+    text: str,
+    topic_terms: list[str],
+    limit: int = 2,
+    *,
+    minimum_relevance: int = 1,
+    required_groups: list[set[str]] | None = None,
+    exclude_phrase: str = "",
+) -> list[str]:
     """Find short, number-bearing sentences likely to contain a reported finding."""
     # Splitting on paragraph breaks and sentence ends avoids feeding full papers to Ollama.
     sentences = re.split(r"\n+|(?<=[.!?])\s+(?=[A-Z0-9])", text)
     ranked: list[tuple[int, str]] = []
     seen: set[str] = set()
+    normalized_query = re.sub(r"[^a-z0-9]+", " ", exclude_phrase.casefold()).strip()
     for sentence in sentences:
         clean = " ".join(sentence.split()).strip(" -*#")
         normalised = _normalise_quote(clean)
         if not clean or len(clean) < 35 or len(clean) > 700 or normalised in seen:
             continue
+        comparable = re.sub(r"[^a-z0-9]+", " ", clean.casefold()).strip()
+        if normalized_query and (comparable == normalized_query or normalized_query in comparable):
+            continue
         if not STATEMENT_SIGNAL.search(clean):
             continue
         seen.add(normalised)
         words = set(re.findall(r"[a-z0-9]+", clean.casefold()))
+        if any(not group.intersection(words) for group in (required_groups or [])):
+            continue
         # Prefer passages that mention the topic and describe a measurable result.
         relevance = sum(term in words for term in topic_terms)
         relevance += sum(word in clean.casefold() for word in ("study", "survey", "registered", "reported", "found"))
+        if relevance < minimum_relevance:
+            continue
         ranked.append((relevance, clean))
     ranked.sort(key=lambda item: (item[0], len(item[1]) < 400), reverse=True)
     return [sentence for _, sentence in ranked[:limit]]
@@ -179,6 +196,39 @@ def _normalise_quote(text: str) -> str:
     return " ".join(text.casefold().split())
 
 
+def _numeric_claim_is_supported(claim: str, evidence: str) -> bool:
+    """Check that answer numbers occur in evidence, allowing ordinary rounding."""
+    number_pattern = re.compile(
+        r"(?<![\w])(?P<number>\d{1,3}(?:[,\s]\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)"
+        r"(?:\s*(?P<unit>trillion|billion|million|thousand))?(?!\w)",
+        re.IGNORECASE,
+    )
+    scales = {"thousand": 1_000, "million": 1_000_000, "billion": 1_000_000_000, "trillion": 1_000_000_000_000}
+
+    def values(text: str) -> list[tuple[float, float]]:
+        found = []
+        for match in number_pattern.finditer(text):
+            raw = match.group("number")
+            try:
+                value = float(raw.replace(",", "").replace(" ", ""))
+            except ValueError:
+                continue
+            decimals = len(raw.partition(".")[2]) if "." in raw else 0
+            unit = (match.group("unit") or "").casefold()
+            scale = scales.get(unit, 1)
+            value *= scale
+            # A displayed rounded value is accurate to half of its last shown digit.
+            tolerance = (0.5 * (10 ** -decimals)) * scale
+            found.append((value, tolerance))
+        return found
+
+    evidence_values = values(evidence)
+    return all(
+        any(abs(value - source_value) <= max(tolerance, source_tolerance) for source_value, source_tolerance in evidence_values)
+        for value, tolerance in values(claim)
+    )
+
+
 def find_topic_statistics(topic: str, focus: str = "") -> dict[str, Any]:
     """Find explicit, source-checkable statistics about a topic using public search."""
     topic = topic.strip()
@@ -192,6 +242,23 @@ def find_topic_statistics(topic: str, focus: str = "") -> dict[str, Any]:
         f"{topic} {focus} study survey data",
         f"{topic} {focus} report figures percentage",
     ]
+    current_year = date.today().year
+    direct_question = bool(re.search(
+        r"\b(how many|how much|what is|what are|current|today|right now|population)\b",
+        topic,
+        re.I,
+    ))
+    # Direct questions often need a recent estimate, while ordinary topics benefit more
+    # from research-oriented searches. Keep those fresh searches focused on question-like input.
+    if direct_question:
+        if re.search(r"\b(league|wins?|won|goals?|points?)\b", topic, re.I):
+            search_queries.append(f"{topic} football league table standings {current_year}")
+        elif re.search(r"\b(world|global)\b", topic, re.I) and re.search(r"\b(people|population)\b", topic, re.I):
+            search_queries.append(
+                f"world population estimate {current_year} United Nations Population Division"
+            )
+        else:
+            search_queries.append(f"{topic} {focus} latest estimate {current_year} official data")
     search_items: list[dict[str, str]] = []
     seen_urls: set[str] = set()
     for query in search_queries:
@@ -220,14 +287,60 @@ def find_topic_statistics(topic: str, focus: str = "") -> dict[str, Any]:
     if not search_items:
         return {"statistics": [], "sources": [], "message": "Search returned no usable source links."}
 
-    topic_terms = _topic_terms(topic, focus)
+    question_fillers = {
+        "how", "many", "much", "what", "does", "did", "do", "has", "have", "had",
+        "is", "are", "was", "were", "there", "the", "in", "on", "at", "of", "to",
+        "for", "a", "an", "it", "its", "current", "today", "now", "right",
+    }
+    topic_terms = [
+        term for term in _topic_terms(topic, focus)
+        if term not in question_fillers and not term.isdigit()
+    ]
+    required_groups: list[set[str]] = []
+    # Keep common question targets (like wins or goals) in the retrieved evidence so
+    # a general team-history sentence cannot pass as an answer to a sports question.
+    metric_groups = [
+        {"win", "wins", "won", "victory", "victories"},
+        {"goal", "goals"},
+        {"point", "points"},
+        {"appearance", "appearances"},
+        {"title", "titles"},
+        {"trophy", "trophies"},
+        {"match", "matches", "game", "games"},
+    ]
+    raw_query_words = set(re.findall(r"[a-z0-9]+", f"{topic} {focus}".casefold()))
+    if re.search(r"\bhow many\b", topic, re.I):
+        required_groups.extend(group for group in metric_groups if group.intersection(raw_query_words))
+        # Preserve named teams, people, and places from the question as a relevance check.
+        named_entities = [
+            word.casefold()
+            for index, word in enumerate(re.findall(r"\b[A-Z][a-z]{3,}\b", topic))
+            if index > 0 and word.casefold() not in question_fillers
+        ]
+        required_groups.extend({entity} for entity in named_entities)
+        requested_years = re.findall(r"\b(?:19|20)\d{2}\b", f"{topic} {focus}")
+        required_groups.extend({year} for year in requested_years)
+        if re.search(r"\b(league|wins?|won|goals?|points?)\b", topic, re.I):
+            sport_terms = set().union(*metric_groups) | {"league", "season", "year", "football", "club", "team"}
+            subject_terms = [
+                term for term in topic_terms
+                if term not in sport_terms and not re.fullmatch(r"(?:19|20)\d{2}", term)
+            ]
+            required_groups.extend({term} for term in subject_terms)
+    minimum_relevance = 2 if direct_question and len(topic_terms) > 1 else 1
     # Inspect pages whose title or snippet best matches the requested topic first.
-    search_items.sort(
-        key=lambda item: sum(
-            term in f"{item['title']} {item['snippet']}".casefold() for term in topic_terms
-        ),
-        reverse=True,
-    )
+    def search_relevance(item: dict[str, str]) -> int:
+        text = f"{item['title']} {item['snippet']}".casefold()
+        score = sum(term in text for term in topic_terms)
+        if direct_question:
+            score += 3 * (str(current_year) in text)
+            score += 2 * any(term in text for term in ("latest", "current", "estimate", "population"))
+            score += any(term in text for term in ("united nations", "population division", "world bank"))
+            if re.search(r"\b(world|global)\b", topic, re.I) and re.search(r"\b(people|population)\b", topic, re.I):
+                score += 3 * ("population" in text)
+        return score
+
+    search_items.sort(key=search_relevance, reverse=True)
 
     sources: list[dict[str, str]] = []
     for item in search_items[:5]:
@@ -252,9 +365,17 @@ def find_topic_statistics(topic: str, focus: str = "") -> dict[str, Any]:
             # Some publishers block extraction, so keep the snippet as a labelled fallback.
             pass
 
-        passages = _statistic_passages(source["text"], topic_terms)
+        passages = _statistic_passages(
+            source["text"], topic_terms, minimum_relevance=minimum_relevance,
+            required_groups=required_groups, exclude_phrase=topic,
+        )
         if not passages:
-            passages = _statistic_passages(source["snippet"], topic_terms, limit=1)
+            passages = _statistic_passages(
+                source["snippet"], topic_terms, limit=1,
+                minimum_relevance=minimum_relevance,
+                required_groups=required_groups,
+                exclude_phrase=topic,
+            )
         source["model_text"] = "\n".join(passages)[:TOPIC_MODEL_SOURCE_CHARS]
         sources.append(source)
 
@@ -269,8 +390,9 @@ def find_topic_statistics(topic: str, focus: str = "") -> dict[str, Any]:
     if evidence:
         result = ask_json(
             TOPIC_STATISTICS_INSTRUCTIONS,
-            f"TOPIC: {topic}\nADDITIONAL FOCUS: {focus or 'none'}\n\nSOURCE MATERIAL (untrusted):\n{evidence}",
-            max_output_tokens=700,
+            f"CURRENT DATE: {date.today().isoformat()}\nTOPIC: {topic}\n"
+            f"ADDITIONAL FOCUS: {focus or 'none'}\n\nSOURCE MATERIAL (untrusted):\n{evidence}",
+            max_output_tokens=900,
         )
 
     # Only accept a source and passage the model could actually read.
@@ -307,27 +429,68 @@ def find_topic_statistics(topic: str, focus: str = "") -> dict[str, Any]:
             "text_kind": source["text_kind"],
         })
 
-    # If the model misses its format or declines a good passage, show the exact source sentence.
-    # This is source discovery, not a model-written summary.
-    if not verified:
-        for source in model_sources:
-            for passage in source["model_text"].splitlines():
-                if not STATEMENT_SIGNAL.search(passage):
-                    continue
-                year_match = re.search(r"\b(?:19|20)\d{2}\b", passage)
-                verified.append({
-                    "statistic": passage,
-                    "scope": "Check the source wording for location, population, and denominator",
-                    "year": year_match.group(0) if year_match else "Not stated in excerpt",
-                    "source_id": source["id"],
-                    "supporting_excerpt": passage,
-                    "text_kind": source["text_kind"],
-                })
-                break
-            if len(verified) >= 5:
-                break
+    # Validate the answer separately from the exact-quote statistic list. Every source
+    # label and every number in this short answer must be present in the cited excerpts.
+    answer: dict[str, Any] = {}
+    answer_text = str(result.get("answer", "")).strip()
+    answer_source_ids = result.get("answer_source_ids", [])
+    if not isinstance(answer_source_ids, list):
+        answer_source_ids = []
+    answer_sources = [
+        source_by_id[source_id]
+        for source_id in answer_source_ids
+        if isinstance(source_id, str) and source_id in source_by_id
+    ]
+    answer_evidence = " ".join(source["model_text"] for source in answer_sources)
+    answer_type = str(result.get("answer_type", "")).strip()
+    if (
+        answer_text
+        and answer_type in {"Current source-backed estimate", "Dated source-backed figure"}
+        and answer_sources
+        and _numeric_claim_is_supported(answer_text, answer_evidence)
+    ):
+        answer_as_of = str(result.get("answer_as_of", "Not stated in source")).strip()
+        if not _numeric_claim_is_supported(answer_as_of, answer_evidence):
+            answer_as_of = "Date not stated in cited source"
+        answer = {
+            "text": answer_text,
+            "type": answer_type,
+            "as_of": answer_as_of,
+            "source_ids": list(dict.fromkeys(source["id"] for source in answer_sources)),
+        }
+    elif verified:
+        # Give a useful dated answer when the model misses its answer field, without
+        # relabelling an older result as a current estimate.
+        newest = max(
+            verified,
+            key=lambda item: int(item["year"]) if item["year"].isdigit() else -1,
+        )
+        year = newest["year"]
+        answer = {
+            "text": (
+                f"The newest dated figure I found is: {newest['statistic']}. "
+                + ("I couldn't verify a newer estimate in these results." if year.isdigit() else "The excerpt does not give a year, so I can't tell how current it is.")
+            ),
+            "type": "Dated source-backed figure",
+            "as_of": year,
+            "source_ids": [newest["source_id"]],
+        }
+    elif answer_text and answer_type == "No reliable answer" and not re.search(r"\d", answer_text):
+        answer = {
+            "text": answer_text,
+            "type": "No reliable answer",
+            "as_of": "Not available",
+            "source_ids": [],
+        }
+    else:
+        answer = {
+            "text": "I couldn't make a reliable estimate from the source text I could retrieve. Try a more specific topic or add a place, population, or year.",
+            "type": "No reliable answer",
+            "as_of": "Not available",
+            "source_ids": [],
+        }
 
-    return {"statistics": verified, "sources": sources}
+    return {"answer": answer, "statistics": verified, "sources": sources}
 
 
 def check_claim_in_library(claim: str, n_results: int = 6) -> dict[str, Any]:
@@ -469,6 +632,7 @@ def explain_studies(
     source_names: list[str],
     priorities: list[str] | None = None,
     project_context: str = "",
+    shortlist_context: str = "",
 ) -> dict[str, Any]:
     """Summarize up to three indexed papers and compare their scope and findings."""
     topic = topic.strip()
@@ -527,6 +691,7 @@ def explain_studies(
         payload = (
             f"RESEARCH GOAL: {topic}\nPROJECT CONTEXT: {project_context or 'Not supplied'}\n"
             f"REVIEW PRIORITIES: {priority_text}\n"
+            f"LITERATURE SCOUT CONTEXT (metadata clue only, not PDF evidence): {shortlist_context[:1200] or 'Not supplied'}\n"
             f"PAPER ID: {document_id}\nPDF FILE: {paper['source']}\n\n"
             f"EXCERPTS:\n{paper['evidence_text']}"
         )

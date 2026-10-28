@@ -33,7 +33,8 @@ Ollama should be running while you use CorpusAudit. To use a different model or 
 ## Use the app
 
 - **Statistic Checker:** Paste the statistic and choose Web search or My PDF library. Web search works without uploading a document.
-- **Find statistics:** Discover figures about a topic, optionally narrowed by place, population, or year. It searches with several research-focused queries, looks through retrieved pages for number-bearing passages, and links each finding to its source. If the local model misses a passage, the app can show the source sentence directly.
+- **Find statistics:** Discover figures about a topic, optionally narrowed by place, population, or year. It leads with a concise answer when retrieved sources support one, then shows the exact quoted findings separately. For direct or time-sensitive questions it also searches for recent estimates. A dated figure is labelled as dated rather than presented as today's value; any rounded answer must be traceable to the value in its cited source passages.
+- **Literature Scout:** Search OpenAlex scholarly records by research question or follow papers cited by / citing a seed paper. Save project profiles locally, inspect abstracts and open-access links, and shortlist up to three papers. When Semantic Scholar supplies citation sentences, the local model can suggest a cautious citation role and show the exact sentence. A clickable session trail lets you revisit earlier searches. Send a shortlist and its context to Study Explainer; add the PDFs to your local library for full passage review. Search terms and seed identifiers are sent to those public scholarly APIs; saved project profiles remain in the ignored local `data/` folder.
 - **Research Explorer:** Add reports in the sidebar and ask about a metric, year, country, or population.
 - **Evidence Library:** See what is indexed or clear the local index. Clearing the index does not delete your original PDFs.
 - **Study Explainer:** Search all indexed PDFs for a question, choose up to three matching papers, and optionally describe what you are trying to build. Set priorities such as exact task match, benchmark evidence, robustness, or deployment practicality. For computer-vision research it distinguishes tasks such as object detection, fine-grained recognition, face verification, and face identification, and looks for methods, equations or algorithms, datasets, metrics, results, baselines, and limitations. It explains useful passages in plain language, compares the selected papers with practical guidance about which supported ideas may fit the project, and cites filenames plus PDF pages. If the extracted text names a figure or equation, it points to that too. Equations are shown as extracted from the PDF text for inspection. Recommendations are a shortlist aid, not a paper-quality score or a decision to discard a paper.
@@ -45,6 +46,7 @@ app.py                    Streamlit entry point
 ui/                       Page sections and shared display helpers
 corpus_audit_core/
   analysis.py              Research answers and claim checks
+  literature.py            Scholarly search, citation trails, and profiles
   documents.py             PDF extraction, indexing, retrieval, and source ranking
   llm.py                   Local Ollama client
   prompts.py               Model instructions
@@ -65,6 +67,8 @@ For web checks, `ddgs` searches public search engines and returns titles, links,
 ## Current limits
 
 - Public search can be unreliable or rate-limited. It may miss the original source.
+- Literature Scout depends on OpenAlex and Semantic Scholar metadata; records, abstracts, citation contexts, and open-access links may be incomplete. A citation-role label is a local model interpretation, not proof of technical lineage or quality. Project profiles are saved locally in the ignored `data/` folder.
+- Public scholarly APIs can rate-limit requests or change their response data. The Scout reports papers found in its indexes, not every paper published on a subject. An absent citation edge does not prove that two works are unrelated.
 - Search results and snippets are sent to the local model, but the claim itself is sent to the search provider.
 - Scanned PDFs and complex tables are not parsed yet.
 - Study Explainer only reviews a few retrieved passages per paper. Important methods, equations, results, or limitations may be elsewhere in the PDF; verify recommendations in the original paper.

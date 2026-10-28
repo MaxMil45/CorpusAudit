@@ -40,11 +40,30 @@ def render_topic_statistics() -> None:
 
         stats = result.get("statistics", [])
         sources = {source["id"]: source for source in result.get("sources", [])}
+        answer = result.get("answer", {})
+        if answer.get("text"):
+            st.markdown("### Best available answer")
+            st.info(answer["text"])
+            if answer.get("as_of"):
+                st.caption(
+                    f"{answer.get('type', 'Answer')} · As of: {answer['as_of']}. "
+                    "This answer is separate from the exact quoted findings below."
+                )
+            for source_id in answer.get("source_ids", []):
+                source = sources.get(source_id, {})
+                if source.get("url"):
+                    st.link_button(
+                        f"Check answer source · {source.get('title', source_id)}",
+                        source["url"],
+                        key=f"topic_answer_{source_id}",
+                    )
+
         if not stats:
-            st.info(
-                "I found search results, but couldn't extract a clear numerical finding from the pages I could read. "
-                "Try a broader topic or remove the optional focus. Some sites block page reading."
-            )
+            if not answer.get("text"):
+                st.info(
+                    "I found search results, but couldn't extract a clear numerical finding from the pages I could read. "
+                    "Try a broader topic or remove the optional focus. Some sites block page reading."
+                )
         else:
             st.markdown(f"### {len(stats)} source-backed result{'s' if len(stats) != 1 else ''}")
             for index, item in enumerate(stats, 1):

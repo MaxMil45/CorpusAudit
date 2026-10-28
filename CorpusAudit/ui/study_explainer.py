@@ -1,13 +1,14 @@
 """Help a researcher screen and compare papers already in the local PDF library."""
 
 import re
+import hashlib
 
 import streamlit as st
 
 from corpus_audit_core.analysis import explain_studies
 from corpus_audit_core.documents import get_collection_stats, rank_sources_for_question
 
-STUDY_RESULT_VERSION = 4
+STUDY_RESULT_VERSION = 5
 
 
 def _render_study_result(result: dict) -> None:
@@ -143,7 +144,35 @@ def render_study_explainer() -> None:
         st.session_state.pop("study_result_signature", None)
         st.session_state["study_result_version"] = STUDY_RESULT_VERSION
 
+    scout_handoff = st.session_state.get("study_scout_handoff") or {}
+    if scout_handoff and not st.session_state.get("study_scout_prefill_applied"):
+        st.session_state["study_explainer_topic"] = scout_handoff.get("query", "")
+        st.session_state["study_project_context"] = scout_handoff.get("profile", "")
+        st.session_state["study_scout_prefill_applied"] = True
+
     st.subheader("Study explainer")
+    if scout_handoff:
+        st.info(
+            f"Literature Scout passed {len(scout_handoff.get('papers', []))} paper(s) and your project context. "
+            "Add the papers’ PDFs to your local library; Scout abstracts guide the review but are not treated as PDF evidence."
+        )
+        with st.expander("Review the Scout shortlist context"):
+            for paper in scout_handoff.get("papers", []):
+                st.markdown(f"**{paper.get('title', 'Selected paper')}** · {paper.get('year') or 'year unknown'}")
+                if paper.get("doi"):
+                    st.caption(paper["doi"])
+                st.write("Why shortlisted: " + paper.get("match_reason", "No match note"))
+                if paper.get("abstract"):
+                    st.write(paper["abstract"])
+                if paper.get("url"):
+                    paper_key = hashlib.sha1((paper.get("doi") or paper.get("title", "paper")).encode()).hexdigest()[:10]
+                    st.link_button(f"Open paper · {paper.get('title', 'paper')}", paper["url"], key=f"scout_handoff_{paper_key}")
+        if st.button("Clear Literature Scout context", key="clear_study_scout_handoff"):
+            st.session_state.pop("study_scout_handoff", None)
+            st.session_state.pop("study_scout_prefill_applied", None)
+            st.session_state.pop("study_explainer_topic", None)
+            st.session_state.pop("study_project_context", None)
+            st.rerun()
     st.write(
         "Search the reports in your library for a research question, choose up to three likely matches, "
         "then get a structured summary and a side-by-side comparison. For recognition research, include "
@@ -251,11 +280,18 @@ def render_study_explainer() -> None:
         if st.button("Explain selected papers", type="primary", disabled=not selected):
             with st.spinner("Reading the selected papers and comparing their evidence…"):
                 try:
+                    shortlist_context = "\n\n".join(
+                        f"{paper.get('title', 'Paper')} ({paper.get('year') or 'year unknown'})\n"
+                        f"Scout match note: {paper.get('match_reason', '')}\n"
+                        f"Abstract (orientation only): {paper.get('abstract', '')[:700]}"
+                        for paper in scout_handoff.get("papers", [])[:3]
+                    )
                     result = explain_studies(
                         st.session_state.get("study_topic_for_results", topic),
                         selected,
                         st.session_state.get("study_priorities_for_results", []),
                         st.session_state.get("study_project_context_for_results", ""),
+                        shortlist_context,
                     )
                 except Exception as exc:
                     st.error(f"Could not explain these papers: {exc}")
@@ -267,6 +303,7 @@ def render_study_explainer() -> None:
                 tuple(selected),
                 tuple(st.session_state.get("study_priorities_for_results", [])),
                 st.session_state.get("study_project_context_for_results", ""),
+                tuple((paper.get("doi", ""), paper.get("title", "")) for paper in scout_handoff.get("papers", [])),
             )
 
     result = st.session_state.get("study_result")
@@ -276,6 +313,7 @@ def render_study_explainer() -> None:
             tuple(st.session_state.get("study_selected_sources", [])),
             tuple(st.session_state.get("study_priorities_for_results", [])),
             st.session_state.get("study_project_context_for_results", ""),
+            tuple((paper.get("doi", ""), paper.get("title", "")) for paper in scout_handoff.get("papers", [])),
         )
         if st.session_state.get("study_result_signature") != current_signature:
             st.info("You changed the topic or selected papers. Explain them again to refresh these summaries.")
